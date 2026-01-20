@@ -1,0 +1,9 @@
+#!/bin/bash
+#SBATCH -J hello_mpi
+#SBATCH -N 2
+#SBATCH -n 4
+#SBATCH -o output/slurm-%j.out
+#SBATCH -e output/slurm-%j.err
+
+source set_env.sh
+mpirun -n 4 -N 2 ./bin/hello
