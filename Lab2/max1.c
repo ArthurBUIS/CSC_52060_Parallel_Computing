@@ -21,15 +21,18 @@ int main(int argc, char**argv) {
   MPI_Comm_size(MPI_COMM_WORLD, &size);
 
   /* Check the input arguments */
-  if(argc <3) {
+  if(argc <4) {
     printf("Usage: %s S N\n", argv[0]);
     printf( "\tS: seed for pseudo-random generator\n" ) ;
     printf( "\tN: size of the array\n" ) ;
+    printf( "\tM: number of arrays to generate\n" ) ;
     exit( 1 ) ;
   }
 
   s = atoi(argv[1]);
   n = atoi(argv[2]);
+  int m = atoi(argv[3]);
+
   srand48(s);
 
   /* Allocate the array */
