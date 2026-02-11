@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <math.h>
 #include <sys/time.h>
+#include <mpi.h>
+#include <omp.h>
 
 #include "gif_lib.h"
 
@@ -39,161 +41,359 @@ typedef struct animated_gif
 animated_gif *
 load_pixels( char * filename ) 
 {
-    GifFileType * g ;
-    ColorMapObject * colmap ;
-    int error ;
-    int n_images ;
-    int * width ;
-    int * height ;
-    pixel ** p ;
-    int i ;
-    animated_gif * image ;
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    /* Open the GIF image (read mode) */
-    g = DGifOpenFileName( filename, &error ) ;
-    if ( g == NULL ) 
+    GifFileType *g = NULL;
+    int n_images = 0;
+    int *width = NULL;
+    int *height = NULL;
+
+    pixel *global_pixels = NULL;   /* buffer sur le rank 0 */
+    int *img_offsets = NULL;       /* offset de chaque image dans le buffer global */
+    int total_pixels = 0;
+    // J'ai choisi de passer à une représentation en 1D seulement, plus simple vu 
+    // la redistribution des pixels en MPI
+
+// Ici on charge le GIF sur le rank 0 pour préparer la distribution
+    if (rank == 0)
     {
-        fprintf( stderr, "Error DGifOpenFileName %s\n", filename ) ;
-        return NULL ;
-    }
+        int error;
+        g = DGifOpenFileName(filename, &error);
+        if (!g) return NULL;
 
-    /* Read the GIF image */
-    error = DGifSlurp( g ) ;
-    if ( error != GIF_OK )
-    {
-        fprintf( stderr, 
-                "Error DGifSlurp: %d <%s>\n", error, GifErrorString(g->Error) ) ;
-        return NULL ;
-    }
+        if (DGifSlurp(g) != GIF_OK)
+            return NULL;
 
-    /* Grab the number of images and the size of each image */
-    n_images = g->ImageCount ;
+        n_images = g->ImageCount;
 
-    width = (int *)malloc( n_images * sizeof( int ) ) ;
-    if ( width == NULL )
-    {
-        fprintf( stderr, "Unable to allocate width of size %d\n",
-                n_images ) ;
-        return 0 ;
-    }
+        width = malloc(n_images * sizeof(int));
+        height = malloc(n_images * sizeof(int));
+        img_offsets = malloc(n_images * sizeof(int));
 
-    height = (int *)malloc( n_images * sizeof( int ) ) ;
-    if ( height == NULL )
-    {
-        fprintf( stderr, "Unable to allocate height of size %d\n",
-                n_images ) ;
-        return 0 ;
-    }
+        ColorMapObject *colmap = g->SColorMap;
+        if (!colmap) return NULL;
 
-    /* Fill the width and height */
-    for ( i = 0 ; i < n_images ; i++ ) 
-    {
-        width[i] = g->SavedImages[i].ImageDesc.Width ;
-        height[i] = g->SavedImages[i].ImageDesc.Height ;
-
-#if SOBELF_DEBUG
-        printf( "Image %d: l:%d t:%d w:%d h:%d interlace:%d localCM:%p\n",
-                i, 
-                g->SavedImages[i].ImageDesc.Left,
-                g->SavedImages[i].ImageDesc.Top,
-                g->SavedImages[i].ImageDesc.Width,
-                g->SavedImages[i].ImageDesc.Height,
-                g->SavedImages[i].ImageDesc.Interlace,
-                g->SavedImages[i].ImageDesc.ColorMap
-                ) ;
-#endif
-    }
-
-
-    /* Get the global colormap */
-    colmap = g->SColorMap ;
-    if ( colmap == NULL ) 
-    {
-        fprintf( stderr, "Error global colormap is NULL\n" ) ;
-        return NULL ;
-    }
-
-#if SOBELF_DEBUG
-    printf( "Global color map: count:%d bpp:%d sort:%d\n",
-            g->SColorMap->ColorCount,
-            g->SColorMap->BitsPerPixel,
-            g->SColorMap->SortFlag
-            ) ;
-#endif
-
-    /* Allocate the array of pixels to be returned */
-    p = (pixel **)malloc( n_images * sizeof( pixel * ) ) ;
-    if ( p == NULL )
-    {
-        fprintf( stderr, "Unable to allocate array of %d images\n",
-                n_images ) ;
-        return NULL ;
-    }
-
-    for ( i = 0 ; i < n_images ; i++ ) 
-    {
-        p[i] = (pixel *)malloc( width[i] * height[i] * sizeof( pixel ) ) ;
-        if ( p[i] == NULL )
+        /* Calcul taille totale */
+        for (int i = 0; i < n_images; i++)
         {
-        fprintf( stderr, "Unable to allocate %d-th array of %d pixels\n",
-                i, width[i] * height[i] ) ;
-        return NULL ;
-        }
-    }
-    
-    /* Fill pixels */
-
-    /* For each image */
-    for ( i = 0 ; i < n_images ; i++ )
-    {
-        int j ;
-
-        /* Get the local colormap if needed */
-        if ( g->SavedImages[i].ImageDesc.ColorMap )
-        {
-
-            /* TODO No support for local color map */
-            fprintf( stderr, "Error: application does not support local colormap\n" ) ;
-            return NULL ;
-
-            colmap = g->SavedImages[i].ImageDesc.ColorMap ;
+            width[i] = g->SavedImages[i].ImageDesc.Width;
+            height[i] = g->SavedImages[i].ImageDesc.Height;
+            img_offsets[i] = total_pixels;
+            total_pixels += width[i] * height[i];
         }
 
-        /* Traverse the image and fill pixels */
-        for ( j = 0 ; j < width[i] * height[i] ; j++ ) 
+        global_pixels = malloc(total_pixels * sizeof(pixel));
+
+        /* Conversion en RGB */
+        for (int i = 0; i < n_images; i++)
         {
-            int c ;
-
-            c = g->SavedImages[i].RasterBits[j] ;
-
-            p[i][j].r = colmap->Colors[c].Red ;
-            p[i][j].g = colmap->Colors[c].Green ;
-            p[i][j].b = colmap->Colors[c].Blue ;
+            int npix = width[i] * height[i];
+            for (int j = 0; j < npix; j++)
+            {
+                int c = g->SavedImages[i].RasterBits[j];
+                global_pixels[img_offsets[i] + j].r = colmap->Colors[c].Red;
+                global_pixels[img_offsets[i] + j].g = colmap->Colors[c].Green;
+                global_pixels[img_offsets[i] + j].b = colmap->Colors[c].Blue;
+            }
         }
     }
 
-    /* Allocate image info */
-    image = (animated_gif *)malloc( sizeof(animated_gif) ) ;
-    if ( image == NULL ) 
+// Broadcast des informations sur le gif, pour que tous les process en disposent
+
+    MPI_Bcast(&n_images, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if (rank != 0)
     {
-        fprintf( stderr, "Unable to allocate memory for animated_gif\n" ) ;
-        return NULL ;
+        width = malloc(n_images * sizeof(int));
+        height = malloc(n_images * sizeof(int));
+        img_offsets = malloc(n_images * sizeof(int));
     }
 
-    /* Fill image fields */
-    image->n_images = n_images ;
-    image->width = width ;
-    image->height = height ;
-    image->p = p ;
-    image->g = g ;
+    MPI_Bcast(width, n_images, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(height, n_images, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(img_offsets, n_images, MPI_INT, 0, MPI_COMM_WORLD);
 
-#if SOBELF_DEBUG
-    printf( "-> GIF w/ %d image(s) with first image of size %d x %d\n",
-            image->n_images, image->width[0], image->height[0] ) ;
-#endif
+// On calcule les paramètres du scatterv/gatherv
 
-    return image ;
+    int *counts = calloc(size, sizeof(int));
+    int *displs = calloc(size, sizeof(int));
+
+    if (rank == 0)
+    {
+        for (int i = 0; i < n_images; i++)
+        {
+            int dest = i % size;
+            counts[dest] += width[i] * height[i];
+        }
+
+        /* Convertir counts en bytes pour MPI */
+        for (int i = 0; i < size; i++)
+            counts[i] *= sizeof(pixel);
+
+        displs[0] = 0;
+        for (int i = 1; i < size; i++)
+            displs[i] = displs[i-1] + counts[i-1];
+    }
+
+    /* Broadcast counts pour allocation locale */
+    MPI_Bcast(counts, size, MPI_INT, 0, MPI_COMM_WORLD);
+
+    int local_count = counts[rank];
+    pixel *local_pixels = malloc(local_count);
+
+// Scatterv: distribue les pixels à chaque process MPI
+
+    MPI_Scatterv(global_pixels,
+                 counts,
+                 displs,
+                 MPI_BYTE,
+                 local_pixels,
+                 local_count,
+                 MPI_BYTE,
+                 0,
+                 MPI_COMM_WORLD);
+
+// Traitement des pixels par chaque process MPI
+
+    int local_pixel_count = local_count / sizeof(pixel);
+    for (int i = 0; i < local_pixel_count; i++)
+    {
+        local_pixels[i].r = local_pixels[i].r;
+    }
+
+// Gatherv: cette fois on rassemble les pixels modifiés par chaque process MPI, le tout sur le rank 0
+
+    MPI_Gatherv(local_pixels,
+                local_count,
+                MPI_BYTE,
+                global_pixels,
+                counts,
+                displs,
+                MPI_BYTE,
+                0,
+                MPI_COMM_WORLD);
+
+// Dernière étape, on reconstruit la structure 'animated_gif' sur le rank 0
+
+    if (rank == 0)
+    {
+        animated_gif *image = malloc(sizeof(animated_gif));
+        image->n_images = n_images;
+        image->width = width;
+        image->height = height;
+        image->g = g;
+
+        pixel **p = malloc(n_images * sizeof(pixel*));
+
+        for (int i = 0; i < n_images; i++)
+        {
+            int npix = width[i] * height[i];
+            p[i] = &global_pixels[img_offsets[i]];
+        }
+
+        image->p = p;
+        free(img_offsets);
+        free(counts);
+        free(displs);
+        free(local_pixels);
+        return image;
+    }
+
+    /* Libération de la mémoire*/
+    free(width);
+    free(height);
+    free(img_offsets);
+    free(counts);
+    free(displs);
+    free(local_pixels);
+
+    return NULL;
 }
+
+MPI_Datatype MPI_PIXEL;
+
+void create_pixel_type()
+{
+    MPI_Type_contiguous(3, MPI_INT, &MPI_PIXEL);
+    MPI_Type_commit(&MPI_PIXEL);
+}
+
+/*
+ * Load a GIF image from a file and return a
+ * structure of type animated_gif.
+ */
+animated_gif *
+load_pixels( char * filename ) 
+{
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    GifFileType *g = NULL;
+    int n_images = 0;
+    int *width = NULL;
+    int *height = NULL;
+
+    pixel *global_pixels = NULL;   /* buffer sur le rank 0 */
+    int *img_offsets = NULL;       /* offset de chaque image dans le buffer global */
+    int total_pixels = 0;
+// J'ai choisi de passer à une représentation en 1D seulement, plus simple vu 
+// la redistribution des pixels en MPI
+
+// Ici on charge le GIF sur le rank 0 pour préparer la distribution
+
+    if (rank == 0)
+    {
+        int error;
+        g = DGifOpenFileName(filename, &error);
+        if (!g) return NULL;
+
+        if (DGifSlurp(g) != GIF_OK)
+            return NULL;
+
+        n_images = g->ImageCount;
+
+        width = malloc(n_images * sizeof(int));
+        height = malloc(n_images * sizeof(int));
+        img_offsets = malloc(n_images * sizeof(int));
+
+        ColorMapObject *colmap = g->SColorMap;
+        if (!colmap) return NULL;
+
+        for (int i = 0; i < n_images; i++)
+        {
+            width[i] = g->SavedImages[i].ImageDesc.Width;
+            height[i] = g->SavedImages[i].ImageDesc.Height;
+
+            img_offsets[i] = total_pixels;
+            total_pixels += width[i] * height[i];
+        }
+
+        global_pixels = malloc(total_pixels * sizeof(pixel));
+
+        for (int i = 0; i < n_images; i++)
+        {
+            int npix = width[i] * height[i];
+
+            for (int j = 0; j < npix; j++)
+            {
+                int c = g->SavedImages[i].RasterBits[j];
+
+                global_pixels[img_offsets[i] + j].r =
+                    colmap->Colors[c].Red;
+                global_pixels[img_offsets[i] + j].g =
+                    colmap->Colors[c].Green;
+                global_pixels[img_offsets[i] + j].b =
+                    colmap->Colors[c].Blue;
+            }
+        }
+    }
+
+// Broadcast des informations sur le gif, pour que tous les process en disposent
+
+    MPI_Bcast(&n_images, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if (rank != 0)
+    {
+        width = malloc(n_images * sizeof(int));
+        height = malloc(n_images * sizeof(int));
+        img_offsets = malloc(n_images * sizeof(int));
+    }
+
+    MPI_Bcast(width, n_images, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(height, n_images, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(img_offsets, n_images, MPI_INT, 0, MPI_COMM_WORLD);
+
+    /* Broadcast total_pixels */
+    MPI_Bcast(&total_pixels, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+// On calcule les paramètres du scatterv/gatherv pour une répartition égale
+
+    int base = total_pixels / size;
+    int rem  = total_pixels % size;
+
+    int *counts = malloc(size * sizeof(int));
+    int *displs = malloc(size * sizeof(int));
+
+    for (int i = 0; i < size; i++)
+        counts[i] = base + (i < rem ? 1 : 0);
+
+    displs[0] = 0;
+    for (int i = 1; i < size; i++)
+        displs[i] = displs[i-1] + counts[i-1];
+
+    int local_count = counts[rank];
+    pixel *local_pixels = malloc(local_count * sizeof(pixel));
+
+// Scatterv: distribue les pixels à chaque process MPI
+
+    MPI_Scatterv(global_pixels,
+                 counts,
+                 displs,
+                 MPI_PIXEL,
+                 local_pixels,
+                 local_count,
+                 MPI_PIXEL,
+                 0,
+                 MPI_COMM_WORLD);
+
+// Traitement des pixels par chaque process MPI
+
+    for (int i = 0; i < local_count; i++)
+    {
+        /* Exemple neutre */
+        local_pixels[i].r = local_pixels[i].r;
+    }
+
+// Gatherv: rassemble les pixels modifiés de chaque process MPI, le tout sur le rank 0
+
+    MPI_Gatherv(local_pixels,
+                local_count,
+                MPI_PIXEL,
+                global_pixels,
+                counts,
+                displs,
+                MPI_PIXEL,
+                0,
+                MPI_COMM_WORLD);
+
+// Dernière étape, on reconstruit la structure 'animated_gif' sur le rank 0
+
+    if (rank == 0)
+    {
+        animated_gif *image = malloc(sizeof(animated_gif));
+
+        image->n_images = n_images;
+        image->width = width;
+        image->height = height;
+        image->g = g;
+
+        pixel **p = malloc(n_images * sizeof(pixel*));
+
+        for (int i = 0; i < n_images; i++)
+            p[i] = &global_pixels[img_offsets[i]];
+
+        image->p = p;
+
+        free(counts);
+        free(displs);
+        free(local_pixels);
+
+        return image;
+    }
+
+    free(width);
+    free(height);
+    free(img_offsets);
+    free(counts);
+    free(displs);
+    free(local_pixels);
+
+    return NULL;
+}
+
 
 int 
 output_modified_read_gif( char * filename, GifFileType * g ) 
@@ -857,6 +1057,12 @@ main( int argc, char ** argv )
     struct timeval t1, t2;
     double duration ;
 
+    int mpi_rank, mpi_number, mpi_provided_thread_support ;
+
+    MPI_Init_thread( &argc, &argv, MPI_THREAD_MULTIPLE, &mpi_provided_thread_support ) ;
+    MPI_Comm_rank( MPI_COMM_WORLD, &mpi_rank ) ;
+    MPI_Comm_size( MPI_COMM_WORLD, &mpi_number ) ;
+
     /* Check command-line arguments */
     if ( argc < 3 )
     {
@@ -872,47 +1078,62 @@ main( int argc, char ** argv )
 
     /* Load file and store the pixels in array */
     image = load_pixels( input_filename ) ;
-    if ( image == NULL ) { return 1 ; }
+    if ( image == NULL && mpi_rank == 0 ) { 
+        MPI_Finalize();
+        return 1 ; 
+    }
 
     /* IMPORT Timer stop */
     gettimeofday(&t2, NULL);
 
     duration = (t2.tv_sec -t1.tv_sec)+((t2.tv_usec-t1.tv_usec)/1e6);
 
-    printf( "GIF loaded from file %s with %d image(s) in %lf s\n", 
-            input_filename, image->n_images, duration ) ;
+    if ( mpi_rank == 0 )
+    {
+        printf( "GIF loaded from file %s with %d image(s) in %lf s\n", 
+                input_filename, image->n_images, duration ) ;
+    }
 
-    /* FILTER Timer start */
-    gettimeofday(&t1, NULL);
+    /* Only rank 0 continues with processing */
+    if ( mpi_rank == 0 )
+    {
+        /* FILTER Timer start */
+        gettimeofday(&t1, NULL);
 
-    /* Convert the pixels into grayscale */
-    apply_gray_filter( image ) ;
+        /* Convert the pixels into grayscale */
+        apply_gray_filter( image ) ;
 
-    /* Apply blur filter with convergence value */
-    apply_blur_filter( image, 5, 20 ) ;
+        /* Apply blur filter with convergence value */
+        apply_blur_filter( image, 5, 20 ) ;
 
-    /* Apply sobel filter on pixels */
-    apply_sobel_filter( image ) ;
+        /* Apply sobel filter on pixels */
+        apply_sobel_filter( image ) ;
 
-    /* FILTER Timer stop */
-    gettimeofday(&t2, NULL);
+        /* FILTER Timer stop */
+        gettimeofday(&t2, NULL);
 
-    duration = (t2.tv_sec -t1.tv_sec)+((t2.tv_usec-t1.tv_usec)/1e6);
+        duration = (t2.tv_sec -t1.tv_sec)+((t2.tv_usec-t1.tv_usec)/1e6);
 
-    printf( "SOBEL done in %lf s\n", duration ) ;
+        printf( "SOBEL done in %lf s\n", duration ) ;
 
-    /* EXPORT Timer start */
-    gettimeofday(&t1, NULL);
+        /* EXPORT Timer start */
+        gettimeofday(&t1, NULL);
 
-    /* Store file from array of pixels to GIF file */
-    if ( !store_pixels( output_filename, image ) ) { return 1 ; }
+        /* Store file from array of pixels to GIF file */
+        if ( !store_pixels( output_filename, image ) ) { 
+            MPI_Finalize();
+            return 1 ; 
+        }
 
-    /* EXPORT Timer stop */
-    gettimeofday(&t2, NULL);
+        /* EXPORT Timer stop */
+        gettimeofday(&t2, NULL);
 
-    duration = (t2.tv_sec -t1.tv_sec)+((t2.tv_usec-t1.tv_usec)/1e6);
+        duration = (t2.tv_sec -t1.tv_sec)+((t2.tv_usec-t1.tv_usec)/1e6);
 
-    printf( "Export done in %lf s in file %s\n", duration, output_filename ) ;
+        printf( "Export done in %lf s in file %s\n", duration, output_filename ) ;
+    }
+
+    MPI_Finalize();
 
     return 0 ;
 }
